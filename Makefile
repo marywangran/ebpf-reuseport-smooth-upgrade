@@ -1,13 +1,20 @@
-CC = clang
-CFLAGS = -O2 -target bpf
+CC = gcc
+CLANG = clang
+CFLAGS = -Wall -O2
+BPF_CFLAGS = -O2 -target bpf
+LDFLAGS = -lbpf -lelf
 
-TARGET = reuseport_kern.o
-SOURCE = reuseport_kern.c
+KERN_TARGET = reuseport_kern.o
+KERN_SOURCE = reuseport_kern.c
+USER_TARGET = user_test
+USER_SOURCE = user_test.c
 
-all: $(TARGET)
+all: $(KERN_TARGET) $(USER_TARGET)
 
-$(TARGET): $(SOURCE)
-	$(CC) $(CFLAGS) -c $< -o $@
+$(KERN_TARGET): $(KERN_SOURCE)
+	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+
+$(USER_TARGET): $(USER_SOURCE)
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(KERN_TARGET) $(USER_TARGET)
