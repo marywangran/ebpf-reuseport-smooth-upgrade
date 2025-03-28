@@ -14,17 +14,24 @@ struct session_key {
 };
 
 struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 1);
+} rr_counter_map SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1);
     __type(key, int);
-    __type(value, int); 
+    __type(value, int); //
 } size_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65536);
     __type(key, struct session_key);
-    __type(value, int); 
+    __type(value, int); //
 } session_map SEC(".maps");
 
 struct {
@@ -62,21 +69,23 @@ int reuseport_prog(struct sk_reuseport_md *ctx)
     };
 
     int key0 = 0;
-
+    int *size = bpf_map_lookup_elem(&size_map, &key0);
+    if (!size) {
+        __u32 init_size = 0;
+        bpf_map_update_elem(&size_map, &key0, &init_size, BPF_NOEXIST);
+    }
     int *idx = bpf_map_lookup_elem(&session_map, &key);
     if (idx) {
         return *idx;
     }
 
-    int *size = bpf_map_lookup_elem(&size_map, &key0);
-    if (!size) {
-        __u32 init_size = MAX_WORKERS;
-        bpf_map_update_elem(&size_map, &key0, &init_size, BPF_NOEXIST);
-    }
-    static __u32 rr_counter = 0;
-    int _idx = __sync_fetch_and_add(&rr_counter, 1) % MAX_WORKERS;
-    int new_idx = size - _idx; // 新 session 只选择最后 MAX_WORKERS 个 worker，让前面 size - MAX_WORKERS 个 worker 自然老化
- 
+    __u32 key00 = 0;
+    __u32 *rr_counter = bpf_map_lookup_elem(&rr_counter_map, &key00);
+    __sync_fetch_and_add(rr_counter, 1);
+    int _idx = *rr_counter % MAX_WORKERS;
+    int new_idx = *size - _idx;
+
+
     bpf_map_update_elem(&session_map, &key, &new_idx, BPF_ANY);
 
     int refcnt_key = (1 << 16) | new_idx;
