@@ -11,6 +11,8 @@
 #define SESSION_MAP_NAME "session_map"
 #define REDIRECT_MAP_NAME "redirect_map"
 
+int g_curr_idx = 0, g_curr_pos = 0；
+
 void reload(int size_map_fd, int session_map_fd);
 void session_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int redirect_map_fd, int socket_idx);
 void session_value_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int redirect_map_fd, int curr_value);
@@ -104,6 +106,9 @@ void reload(int size_map_fd, int session_map_fd)
             close(sockfd);
             continue;
         }
+	bpf_map_update_elem(redirect_map_fd, &g_curr_pos, &g_curr_idx, BPF_EXIST);
+	g_curr_pos += 1；
+	g_curr_idx += 1；
         // 基本假设 socket 会追加到 group 最后，自动递增索引，由新 session 存储到 session_map 中
         // 递增 size_map 中 size 项
         __u32 key = 0;
@@ -152,6 +157,8 @@ void session_value_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, 
     }
     bpf_map_update_elem(redirect_map_fd, &pos, &max_value, BPF_EXIST);
 
+    g_curr_pos -= 1；
+    g_curr_idx -= 1；
     if (pos < *size - MAX_WORKERS) {
         // 递减 size
         __sync_fetch_and_sub(size, 1);
@@ -183,5 +190,7 @@ void session_value_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, 
             return;
         }
 	// TODO   必须追踪 socket 创建顺序，并更新 redirect map，否则无法运行
+	g_curr_idx += 1；
+	bpf_map_update_elem(redirect_map_fd, &pos, &g_curr_idx, BPF_EXIST);
     }
 }
