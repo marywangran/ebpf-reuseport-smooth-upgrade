@@ -9,4 +9,4 @@
 
 - session 退出（由 worker 调用）：递减 refcnt_map 对应 socket_idx 引用计数，递减到 0，socket 退出
 
-- session_map 中 value 为 curr_value 的 socket 退出（由 worker 调用）【该步骤可能会丢包，串包】：做一致性 hash，遍历 session_map，所有 value > curr_value && value < size - MAX_WORKERS 的，update，value -= 1，递减 size：size -= 1，若 value >= size - MAX_WORKERS，则 value -= 1，新建 worker socket，不递减 size
+- session_map 中 value 为 curr_value 的 socket 退出（由 worker 调用）【该步骤可能会丢包，串包】：做一致性 hash，更新 redirect map，若 sk_pos < size - MAX_WORKERS，递减 size，否则，只新建 worker socket。
