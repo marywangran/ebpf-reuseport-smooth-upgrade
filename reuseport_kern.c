@@ -13,6 +13,14 @@ struct session_key {
     __u16 dst_port;
 };
 
+// 由于 Linux reuseport socket 退出时会用 group 内最后一个 socket 填补当前退出者的 index，故需要一个 redirect map
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65535);
+    __type(key, __u32);
+    __type(value, __u32);
+} index_redirect_map SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, __u32);
@@ -31,7 +39,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65536);
     __type(key, struct session_key);
-    __type(value, int); //
+    __type(value, int); 
 } session_map SEC(".maps");
 
 struct {
@@ -74,9 +82,12 @@ int reuseport_prog(struct sk_reuseport_md *ctx)
         __u32 init_size = 0;
         bpf_map_update_elem(&size_map, &key0, &init_size, BPF_NOEXIST);
     }
+    // 首先查 session map
     int *idx = bpf_map_lookup_elem(&session_map, &key);
     if (idx) {
-        return *idx;
+        // 再查 redirect map
+	    __u32 *_idx = bpf_map_lookup_elem(&index_redirect_map, idx);
+        return _idx ? *_idx : *idx;;
     }
 
     __u32 key00 = 0;
@@ -85,10 +96,11 @@ int reuseport_prog(struct sk_reuseport_md *ctx)
     int _idx = *rr_counter % MAX_WORKERS;
     int new_idx = *size - _idx;
 
-
+    __u32 *_idx = bpf_map_lookup_elem(&index_redirect_map, &new_idx);
+    __u32 final_idx = _idx ? *_idx : new_idx;
     bpf_map_update_elem(&session_map, &key, &new_idx, BPF_ANY);
 
-    int refcnt_key = (1 << 16) | new_idx;
+    int refcnt_key = (1 << 16) | final_idx;
     __u32 *refcnt = bpf_map_lookup_elem(&refcnt_map, &refcnt_key);
     if (refcnt) {
         __sync_fetch_and_add(refcnt, 1);
@@ -97,5 +109,5 @@ int reuseport_prog(struct sk_reuseport_md *ctx)
         bpf_map_update_elem(&refcnt_map, &refcnt_key, &init_refcnt, BPF_NOEXIST);
     }
 
-    return new_idx;
+    return final_idx;
 }
