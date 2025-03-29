@@ -9,11 +9,13 @@
 #define SIZE_MAP_NAME "size_map"
 #define REFCNT_MAP_NAME "refcnt_map"
 #define SESSION_MAP_NAME "session_map"
+#define REDIRECT_MAP_NAME "redirect_map"
 
 void reload(int size_map_fd, int session_map_fd);
-void session_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int socket_idx);
-void session_value_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int curr_value);
-int init_map_fd(struct bpf_object *obj, const char *map_name) {
+void session_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int redirect_map_fd, int socket_idx);
+void session_value_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int redirect_map_fd, int curr_value);
+int init_map_fd(struct bpf_object *obj, const char *map_name)
+{
     int map_fd = bpf_object__find_map_fd_by_name(obj, map_name);
     if (map_fd < 0) {
         fprintf(stderr, "Error finding eBPF map: %s\n", map_name);
@@ -27,7 +29,6 @@ int main(int argc, char **argv)
     struct bpf_program *prog = NULL;
     int err = 0;
 
-    //struct bpf_object_open_opts opts = {};
     obj = bpf_object__open_file("reuseport_kern.o", NULL);
     if (libbpf_get_error(obj)) {
         fprintf(stderr, "Error loading eBPF program: %d\n", err);
@@ -49,8 +50,9 @@ int main(int argc, char **argv)
     int size_map_fd = init_map_fd(obj, SIZE_MAP_NAME);
     int refcnt_map_fd = init_map_fd(obj, REFCNT_MAP_NAME);
     int session_map_fd = init_map_fd(obj, SESSION_MAP_NAME);
+    int redirect_map_fd = init_map_fd(obj, REDIRECT_MAP_NAME);
 
-    if (size_map_fd < 0 || refcnt_map_fd < 0 || session_map_fd < 0) {
+    if (size_map_fd < 0 || refcnt_map_fd < 0 || session_map_fd < 0 || redirect_map_fd < 0) {
         bpf_object__close(obj);
         return 1;
     }
@@ -59,10 +61,10 @@ int main(int argc, char **argv)
     reload(size_map_fd, session_map_fd);
 
     // 模拟 session 退出
-    session_exit(refcnt_map_fd, session_map_fd, size_map_fd, 0);
+    session_exit(refcnt_map_fd, session_map_fd, size_map_fd, redirect_map_fd, 0);
 
     // 模拟 session 中 value 为 curr_value 的 socket 退出操作
-    session_value_exit(refcnt_map_fd, session_map_fd, size_map_fd, 5);
+    session_value_exit(refcnt_map_fd, session_map_fd, size_map_fd, redirect_map_fd, 5);
 
     bpf_object__close(obj);
     return 0;
@@ -113,7 +115,7 @@ void reload(int size_map_fd, int session_map_fd)
 }
 
 // session 退出
-void session_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int socket_idx)
+void session_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int redirect_map_fd, int socket_idx)
 {
     __u32 key = socket_idx;
     __u32 *refcnt;
@@ -121,13 +123,13 @@ void session_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int so
         __sync_fetch_and_sub(refcnt, 1);
         if (*refcnt == 0) {
             // socket 退出
-           session_value_exit(refcnt_map_fd, session_map_fd, size_map_fd, key);
+           session_value_exit(refcnt_map_fd, session_map_fd, size_map_fd, redirect_map_fd, key);
         }
     }
 }
 
 // session_map 中 value 为 curr_value 的 socket 退出操作
-void session_value_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int curr_value)
+void session_value_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int redirect_map_fd, int curr_value)
 {
     __u32 size_key = 0;
     __u32 *size;
@@ -136,18 +138,21 @@ void session_value_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, 
     }
 
     // 做一致性 hash，遍历 session_map
+    int max_value = 0, pos = -1;
     for (__u32 key = 0; key < *size; key++) {
         __u32 *value;
-        if (bpf_map_lookup_elem(session_map_fd, &key, &value) == 0) {
-            if (*value > curr_value && *value < *size - MAX_WORKERS) {
-                __sync_fetch_and_sub(value, 1);
-            } else if (*value >= *size - MAX_WORKERS) {
-                __sync_fetch_and_sub(value, 1);
-            }
+        if (bpf_map_lookup_elem(redirect_map_fd, &key, &value) == 0) {
+		    if (*value > max_value) {
+			    max_value = *value;
+		    }
         }
+	    if (*value == curr_value) {
+		    pos = key;
+	    }
     }
+    bpf_map_update_elem(redirect_map_fd, &pos, &max_value, BPF_EXIST);
 
-    if (curr_value < *size - MAX_WORKERS) {
+    if (pos < *size - MAX_WORKERS) {
         // 递减 size
         __sync_fetch_and_sub(size, 1);
     } else {
@@ -157,6 +162,7 @@ void session_value_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, 
             perror("socket creation failed");
             return;
         }
+
 
         int optval = 1;
         if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval)) < 0) {
@@ -176,5 +182,6 @@ void session_value_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, 
             close(sockfd);
             return;
         }
+	// TODO   必须追踪 socket 创建顺序，并更新 redirect map，否则无法运行
     }
 }
