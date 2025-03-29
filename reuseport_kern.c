@@ -97,7 +97,7 @@ int reuseport_prog(struct sk_reuseport_md *ctx)
     int new_idx = *size - _idx;
 
     __u32 *_idx = bpf_map_lookup_elem(&index_redirect_map, &new_idx);
-    __u32 final_idx = _idx ? *_idx : new_idx;
+    __u32 final_idx = *_idx;
     bpf_map_update_elem(&session_map, &key, &new_idx, BPF_ANY);
 
     int refcnt_key = (1 << 16) | final_idx;
