@@ -162,6 +162,7 @@ void session_value_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, 
     if (pos < *size - MAX_WORKERS) {
         // 递减 size
         __sync_fetch_and_sub(size, 1);
+	// TODO，必须！for-each session map，value 递减
     } else {
         // 新建 worker socket
         int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
