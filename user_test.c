@@ -1,12 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <errno.h>
-#include <unistd.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <bpf/libbpf.h>
-#include <bpf/bpf.h>
 
 #define MAX_WORKERS 10
 #define SIZE_MAP_NAME "size_map"
@@ -24,15 +21,29 @@ int init_map_fd(struct bpf_object *obj, const char *map_name) {
     return map_fd;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv)
+{
     struct bpf_object *obj;
-    int err;
+    struct bpf_program *prog = NULL;
+    int err = 0;
 
-    struct bpf_object_open_opts opts = {};
-    err = bpf_prog_load_xattr("your_ebpf_program.bpf.o", BPF_PROG_TYPE_SOCKET_FILTER, &obj, NULL, &opts);
-    if (err) {
+    //struct bpf_object_open_opts opts = {};
+    obj = bpf_object__open_file("reuseport_kern.o", NULL);
+    if (libbpf_get_error(obj)) {
         fprintf(stderr, "Error loading eBPF program: %d\n", err);
         return 1;
+    }
+    if (bpf_object__load(obj)) {
+        fprintf(stderr, "Failed to load BPF object\n");
+        bpf_object__close(obj);
+        return -1;
+    }
+
+    prog = bpf_object__find_program_by_name(obj, "your_prog_name");
+    if (!prog) {
+        fprintf(stderr, "Failed to find BPF program\n");
+        bpf_object__close(obj);
+        return -1;
     }
 
     int size_map_fd = init_map_fd(obj, SIZE_MAP_NAME);
@@ -58,10 +69,11 @@ int main(int argc, char **argv) {
 }
 
 // reload
-void reload(int size_map_fd, int session_map_fd) {
+void reload(int size_map_fd, int session_map_fd)
+{
     // 创建 MAX_WORKERS 个 reuseport socket
     for (int i = 0; i < MAX_WORKERS; i++) {
-        int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
         if (sockfd < 0) {
             perror("socket creation failed");
             continue;
@@ -90,20 +102,19 @@ void reload(int size_map_fd, int session_map_fd) {
             close(sockfd);
             continue;
         }
-
-        // 这里可以将 socket 信息存储到 session_map 中
-    }
-
-    // 递增 size_map 中 size 项
-    __u32 key = 0;
-    __u32 *size;
-    if (bpf_map_lookup_elem(size_map_fd, &key, &size) == 0) {
-        __sync_fetch_and_add(size, MAX_WORKERS);
+        // 基本假设 socket 会追加到 group 最后，自动递增索引，由新 session 存储到 session_map 中
+        // 递增 size_map 中 size 项
+        __u32 key = 0;
+        __u32 *size;
+        if (bpf_map_lookup_elem(size_map_fd, &key, &size) == 0) {
+            __sync_fetch_and_add(size, MAX_WORKERS);
+        }
     }
 }
 
 // session 退出
-void session_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int socket_idx) {
+void session_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int socket_idx)
+{
     __u32 key = socket_idx;
     __u32 *refcnt;
     if (bpf_map_lookup_elem(refcnt_map_fd, &key, &refcnt) == 0) {
@@ -116,7 +127,8 @@ void session_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int so
 }
 
 // session_map 中 value 为 curr_value 的 socket 退出操作
-void session_value_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int curr_value) {
+void session_value_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, int curr_value)
+{
     __u32 size_key = 0;
     __u32 *size;
     if (bpf_map_lookup_elem(size_map_fd, &size_key, &size) != 0) {
@@ -135,40 +147,34 @@ void session_value_exit(int refcnt_map_fd, int session_map_fd, int size_map_fd, 
         }
     }
 
-    // 递减 size
-    __sync_fetch_and_sub(size, 1);
+    if (curr_value < *size - MAX_WORKERS) {
+        // 递减 size
+        __sync_fetch_and_sub(size, 1);
+    } else {
+        // 新建 worker socket
+        int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sockfd < 0) {
+            perror("socket creation failed");
+            return;
+        }
 
-    // 新建 worker socket
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) {
-        perror("socket creation failed");
-        return;
+        int optval = 1;
+        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval)) < 0) {
+            perror("setsockopt SO_REUSEPORT failed");
+            close(sockfd);
+            return;
+        }
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(8080);
+
+        if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            perror("bind failed");
+            close(sockfd);
+            return;
+        }
     }
-
-    int optval = 1;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval)) < 0) {
-        perror("setsockopt SO_REUSEPORT failed");
-        close(sockfd);
-        return;
-    }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(8080);
-
-    if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind failed");
-        close(sockfd);
-        return;
-    }
-
-    if (listen(sockfd, 5) < 0) {
-        perror("listen failed");
-        close(sockfd);
-        return;
-    }
-
-    // 这里可以将新 socket 信息存储到 session_map 中
 }
